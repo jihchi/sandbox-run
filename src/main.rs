@@ -1,9 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::RawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -17,9 +17,7 @@ fn main() {
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<OsString> = env::args_os().collect();
     let argv0 = &args[0];
-    let uid = unsafe { libc::getuid() };
-    let gid = unsafe { libc::getgid() };
-    let ppid = unsafe { libc::getppid() };
+    let (uid, gid, ppid) = read_proc_self_status()?;
     let cwd = env::current_dir()?;
 
     if which("bwrap").is_none() {
@@ -92,10 +90,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let new_bwrap_tokens = split_args_by_lf(&new_bwrap_args_str);
     let prev_bwrap_tokens = split_args_by_lf(&prev_bwrap_args);
 
-    let env_setenv_args = build_env_pass_through(uid, ppid)?;
+    let env_setenv_args = build_env_pass_through(ppid)?;
 
     let passwd_text = run_getent_passwd(uid);
     let group_text = run_getent_group(gid);
+
+    let passwd_file = home.join("tmp").join(".passwd");
+    let group_file = home.join("tmp").join(".group");
+    fs::write(&passwd_file, &passwd_text)?;
+    fs::write(&group_file, &group_text)?;
 
     let verbose = env::var("VERBOSE")
         .or_else(|_| env::var("verbose"))
@@ -159,8 +162,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     bwrap_argv.extend_from_slice(&oss(&["--setenv", "TMPDIR"]));
     bwrap_argv.push(OsString::from(home.join("tmp")));
 
-    bwrap_argv.extend_from_slice(&oss(&["--bind-data", "5", "/etc/passwd"]));
-    bwrap_argv.extend_from_slice(&oss(&["--bind-data", "4", "/etc/group"]));
+    bwrap_argv.extend_from_slice(&oss(&["--ro-bind"]));
+    bwrap_argv.push(passwd_file.as_os_str().to_owned());
+    bwrap_argv.push(OsString::from("/etc/passwd"));
+    bwrap_argv.extend_from_slice(&oss(&["--ro-bind"]));
+    bwrap_argv.push(group_file.as_os_str().to_owned());
+    bwrap_argv.push(OsString::from("/etc/group"));
 
     for a in &env_setenv_args {
         bwrap_argv.push(a.clone());
@@ -197,11 +204,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("+ bwrap {}", display.join(" "));
     }
 
-    exec_bwrap(&bwrap_argv, &passwd_text, &group_text)
+    let status = Command::new("bwrap").args(&bwrap_argv).status()?;
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 fn oss(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
+}
+
+fn read_proc_self_status() -> Result<(u32, u32, u32), Box<dyn std::error::Error>> {
+    let content = fs::read_to_string("/proc/self/status")?;
+    let mut uid: Option<u32> = None;
+    let mut gid: Option<u32> = None;
+    let mut ppid: Option<u32> = None;
+
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            uid = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("Gid:") {
+            gid = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("PPid:") {
+            ppid = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        }
+    }
+
+    Ok((
+        uid.ok_or("failed to read uid from /proc/self/status")?,
+        gid.ok_or("failed to read gid from /proc/self/status")?,
+        ppid.ok_or("failed to read ppid from /proc/self/status")?,
+    ))
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -216,11 +247,10 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 fn is_executable(path: &Path) -> bool {
-    let c = match CString::new(path.as_os_str().as_bytes()) {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+    match fs::metadata(path) {
+        Ok(meta) => meta.permissions().mode() & 0o111 != 0,
+        Err(_) => false,
+    }
 }
 
 fn resolve_symlink_bin(argv0: &OsStr, base: &OsStr) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -344,9 +374,7 @@ fn load_dotenv(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let export_list = keys.join(" ");
-    let script = format!(
-        ". \"$1\"; export {export_list}; env -0"
-    );
+    let script = format!(". \"$1\"; export {export_list}; env -0");
 
     let output = Command::new("/bin/sh")
         .arg("-c")
@@ -385,8 +413,7 @@ fn parse_null_separated_env(data: &[u8]) -> HashMap<OsString, OsString> {
         if entry.is_empty() {
             continue;
         }
-        let os = OsStr::from_bytes(entry);
-        let s = os.as_bytes();
+        let s = OsStr::from_bytes(entry).as_bytes();
         if let Some(eq) = s.iter().position(|&b| b == b'=') {
             let key = OsStr::from_bytes(&s[..eq]).to_owned();
             let val = OsStr::from_bytes(&s[eq + 1..]).to_owned();
@@ -396,7 +423,7 @@ fn parse_null_separated_env(data: &[u8]) -> HashMap<OsString, OsString> {
     map
 }
 
-fn read_proc_environ(pid: i32) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+fn read_proc_environ(pid: u32) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
     let path = format!("/proc/{pid}/environ");
     let data = fs::read(&path)?;
     let mut keys = HashSet::new();
@@ -412,10 +439,7 @@ fn read_proc_environ(pid: i32) -> Result<HashSet<String>, Box<dyn std::error::Er
     Ok(keys)
 }
 
-fn build_env_pass_through(
-    uid: u32,
-    ppid: i32,
-) -> Result<Vec<OsString>, Box<dyn std::error::Error>> {
+fn build_env_pass_through(ppid: u32) -> Result<Vec<OsString>, Box<dyn std::error::Error>> {
     let parent_keys = read_proc_environ(ppid).unwrap_or_default();
 
     let whitelist_exact: HashSet<&str> = [
@@ -443,8 +467,7 @@ fn build_env_pass_through(
     let mut filtered: Vec<(&str, &OsStr)> = Vec::new();
     for (key, val) in &current_env {
         let name = key.as_str();
-        let in_whitelist =
-            whitelist_exact.contains(name) || name.starts_with("LC_");
+        let in_whitelist = whitelist_exact.contains(name) || name.starts_with("LC_");
         let is_exclusive = exclusive_keys.contains(name);
 
         if !in_whitelist && !is_exclusive {
@@ -458,8 +481,6 @@ fn build_env_pass_through(
         filtered.push((name, val.as_os_str()));
     }
 
-    let _ = uid;
-
     let mut result: Vec<OsString> = Vec::new();
     for (name, val) in filtered.iter().rev() {
         result.push(OsString::from("--setenv"));
@@ -470,8 +491,7 @@ fn build_env_pass_through(
 }
 
 fn read_current_env_ordered() -> Result<Vec<(String, OsString)>, Box<dyn std::error::Error>> {
-    let path = "/proc/self/environ";
-    let data = fs::read(path)?;
+    let data = fs::read("/proc/self/environ")?;
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
 
@@ -522,106 +542,5 @@ fn run_getent_group(gid: u32) -> String {
     match output {
         Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
         Err(_) => String::new(),
-    }
-}
-
-fn exec_bwrap(
-    bwrap_argv: &[OsString],
-    passwd_text: &str,
-    group_text: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::ffi::CStr;
-
-    let passwd_bytes = passwd_text.as_bytes();
-    let group_bytes = group_text.as_bytes();
-
-    let mut bwrap_args: Vec<CString> = Vec::new();
-    bwrap_args.push(CString::new("bwrap")?);
-    for arg in bwrap_argv {
-        bwrap_args.push(CString::new(arg.as_bytes())?);
-    }
-    let bwrap_ptrs: Vec<*const libc::c_char> = bwrap_args
-        .iter()
-        .map(|a| a.as_ptr())
-        .chain(std::iter::once(std::ptr::null()))
-        .collect();
-
-    let bwrap_path = which("bwrap").ok_or("bwrap not found")?;
-    let bwrap_cpath = CString::new(bwrap_path.as_os_str().as_bytes())?;
-
-    unsafe {
-        let passwd_fd = create_memfd(b"passwd\0", passwd_bytes)?;
-        let group_fd = create_memfd(b"group\0", group_bytes)?;
-
-        if passwd_fd != 5 {
-            libc::dup2(passwd_fd, 5);
-            libc::close(passwd_fd);
-        }
-        if group_fd != 4 {
-            libc::dup2(group_fd, 4);
-            libc::close(group_fd);
-        }
-
-        libc::fcntl(4, libc::F_SETFD, 0);
-        libc::fcntl(5, libc::F_SETFD, 0);
-
-        let pid = libc::fork();
-        if pid < 0 {
-            return Err("fork failed".into());
-        }
-        if pid == 0 {
-            libc::execvp(bwrap_cpath.as_ptr(), bwrap_ptrs.as_ptr());
-            let err = *libc::__errno_location();
-            let msg = CStr::from_ptr(libc::strerror(err));
-            libc::write(
-                2,
-                b"sandbox-run: exec bwrap: " as *const u8 as *const libc::c_void,
-                25,
-            );
-            libc::write(
-                2,
-                msg.to_bytes().as_ptr() as *const libc::c_void,
-                msg.to_bytes().len(),
-            );
-            libc::write(2, b"\n" as *const u8 as *const libc::c_void, 1);
-            libc::_exit(127);
-        }
-
-        libc::close(4);
-        libc::close(5);
-
-        let mut status: libc::c_int = 0;
-        libc::waitpid(pid, &mut status, 0);
-
-        if libc::WIFEXITED(status) {
-            std::process::exit(libc::WEXITSTATUS(status));
-        } else if libc::WIFSIGNALED(status) {
-            std::process::exit(128 + libc::WTERMSIG(status));
-        } else {
-            std::process::exit(1);
-        }
-    }
-}
-
-fn create_memfd(name: &[u8], data: &[u8]) -> Result<RawFd, Box<dyn std::error::Error>> {
-    unsafe {
-        let fd = libc::memfd_create(name.as_ptr() as *const libc::c_char, 0);
-        if fd < 0 {
-            return Err("memfd_create failed".into());
-        }
-        let mut written = 0;
-        while written < data.len() {
-            let n = libc::write(
-                fd,
-                data[written..].as_ptr() as *const libc::c_void,
-                data.len() - written,
-            );
-            if n < 0 {
-                return Err("failed to write to memfd".into());
-            }
-            written += n as usize;
-        }
-        libc::lseek(fd, 0, libc::SEEK_SET);
-        Ok(fd)
     }
 }
