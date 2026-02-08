@@ -21,7 +21,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
 
     if which("bwrap").is_none() {
-        eprintln!("Error: Missing /usr/bin/bwrap (apt install bubblewrap?)");
+        eprintln!("Error: Missing bwrap (apt install bubblewrap?)");
         std::process::exit(127);
     }
 
