@@ -25,14 +25,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(127);
     }
 
-    let base = Path::new(argv0).file_name().unwrap_or(OsStr::new("sandbox-run"));
+    let argv0_path = Path::new(argv0);
+    let is_symlink = fs::symlink_metadata(argv0_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
 
-    let (bin, user_args): (PathBuf, Vec<OsString>) = if base != "sandbox-run" {
+    let (bin, user_args): (PathBuf, Vec<OsString>) = if is_symlink {
+        let base = argv0_path.file_name().unwrap_or(argv0.as_ref());
         let resolved = resolve_symlink_bin(argv0, base)?;
         (resolved, args[1..].to_vec())
     } else {
         if args.len() < 2 {
-            eprintln!("Usage: sandbox-run ARG...");
+            let name = argv0_path
+                .file_name()
+                .unwrap_or(OsStr::new("sandbox-run"))
+                .to_string_lossy();
+            eprintln!("Usage: {name} ARG...");
             std::process::exit(1);
         }
         let cmd = &args[1];
