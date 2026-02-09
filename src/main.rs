@@ -272,13 +272,18 @@ fn is_executable(path: &Path) -> bool {
 
 fn resolve_symlink_bin(argv0: &OsStr, base: &OsStr) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let path_var = env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".to_string());
-    let argv0_str = argv0.to_string_lossy();
+    let self_real = fs::canonicalize(argv0).ok();
 
     for dir in path_var.split(':') {
-        let candidate = format!("{dir}/{}", base.to_string_lossy());
-        if argv0_str != candidate && is_executable(Path::new(&candidate)) {
-            return Ok(PathBuf::from(candidate));
+        let candidate = PathBuf::from(format!("{dir}/{}", base.to_string_lossy()));
+        if !is_executable(&candidate) {
+            continue;
         }
+        let candidate_real = fs::canonicalize(&candidate).ok();
+        if candidate_real.is_some() && candidate_real == self_real {
+            continue;
+        }
+        return Ok(candidate);
     }
     Ok(PathBuf::from(argv0))
 }

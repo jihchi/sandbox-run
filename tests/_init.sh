@@ -16,6 +16,8 @@ tmpdir="$(mktemp -d -t sandbox-run_test-XXXXXXX)"
 trap "tree -a -L 4 --si --du '$tmpdir'; rm -fr '$tmpdir'; trap - INT HUP EXIT TERM" INT HUP TERM EXIT
 if [ ! "${CI-}" ]; then case "$tmpdir" in /tmp*|/var/*) ;; *) exit 9 ;; esac; fi
 
-PATH="$(pwd):$PATH"
+REPO_ROOT="$(pwd)"
+cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" >&2
+PATH="$REPO_ROOT/target/release:$PATH"
 HOME="$tmpdir"
 cd "$tmpdir"
