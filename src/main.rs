@@ -52,7 +52,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let prev_bwrap_args = env::var("BWRAP_ARGS").unwrap_or_default();
 
-    load_dotenv(&cwd)?;
+    let dotenv = load_dotenv(&cwd)?;
+
+    let env_get = |key: &str| -> String {
+        dotenv
+            .as_ref()
+            .and_then(|m| m.get(OsStr::new(key)))
+            .map(|v| v.to_string_lossy().into_owned())
+            .unwrap_or_else(|| env::var(key).unwrap_or_default())
+    };
 
     let default_ro_paths: Vec<&str> = vec![
         "/etc/alternatives",
@@ -73,7 +81,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ];
     let rw_paths: Vec<&str> = vec!["/etc/ld.so.conf.d"];
 
-    let sandbox_ro_bind = env::var("SANDBOX_RO_BIND").unwrap_or_default();
+    let sandbox_ro_bind = env_get("SANDBOX_RO_BIND");
     let extra_ro_tokens = parse_sandbox_ro_bind(&sandbox_ro_bind);
 
     let mut ro_bind_paths: Vec<PathBuf> = Vec::new();
@@ -94,11 +102,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let home = cwd.join(".sandbox-home");
     fs::create_dir_all(home.join("tmp"))?;
 
-    let new_bwrap_args_str = env::var("BWRAP_ARGS").unwrap_or_default();
+    let new_bwrap_args_str = env_get("BWRAP_ARGS");
     let new_bwrap_tokens = split_args_by_lf(&new_bwrap_args_str);
     let prev_bwrap_tokens = split_args_by_lf(&prev_bwrap_args);
 
-    let env_setenv_args = build_env_pass_through(ppid)?;
+    let env_setenv_args = build_env_pass_through(ppid, &dotenv)?;
 
     let passwd_text = run_getent_passwd(uid);
     let group_text = run_getent_group(gid);
@@ -108,10 +116,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&passwd_file, &passwd_text)?;
     fs::write(&group_file, &group_text)?;
 
-    let verbose = env::var("VERBOSE")
-        .or_else(|_| env::var("verbose"))
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+    let verbose = {
+        let v = env_get("VERBOSE");
+        if v.is_empty() { env_get("verbose") } else { v }
+    };
+    let verbose = !verbose.is_empty();
 
     eprintln!("sandbox-run: exec bwrap [...] {formatted_cmdline}");
 
@@ -360,10 +369,10 @@ fn expand_glob(pattern: &str) -> Vec<PathBuf> {
     }
 }
 
-fn load_dotenv(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn load_dotenv(cwd: &Path) -> Result<Option<HashMap<OsString, OsString>>, Box<dyn std::error::Error>> {
     let dotenv_path = cwd.join(".env");
     if !dotenv_path.exists() {
-        return Ok(());
+        return Ok(None);
     }
 
     let content = fs::read_to_string(&dotenv_path)?;
@@ -378,7 +387,7 @@ fn load_dotenv(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if keys.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let export_list = keys.join(" ");
@@ -398,21 +407,7 @@ fn load_dotenv(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("failed to source .env (exit {})", output.status).into());
     }
 
-    let env_map = parse_null_separated_env(&output.stdout);
-    let current_keys: HashSet<OsString> = env::vars_os().map(|(k, _)| k).collect();
-
-    unsafe {
-        for key in &current_keys {
-            if !env_map.contains_key(key) {
-                env::remove_var(key);
-            }
-        }
-        for (key, val) in &env_map {
-            env::set_var(key, val);
-        }
-    }
-
-    Ok(())
+    Ok(Some(parse_null_separated_env(&output.stdout)))
 }
 
 fn parse_null_separated_env(data: &[u8]) -> HashMap<OsString, OsString> {
@@ -447,7 +442,10 @@ fn read_proc_environ(pid: u32) -> Result<HashSet<String>, Box<dyn std::error::Er
     Ok(keys)
 }
 
-fn build_env_pass_through(ppid: u32) -> Result<Vec<OsString>, Box<dyn std::error::Error>> {
+fn build_env_pass_through(
+    ppid: u32,
+    dotenv: &Option<HashMap<OsString, OsString>>,
+) -> Result<Vec<OsString>, Box<dyn std::error::Error>> {
     let parent_keys = read_proc_environ(ppid).unwrap_or_default();
 
     let whitelist_exact: HashSet<&str> = [
@@ -464,7 +462,14 @@ fn build_env_pass_through(ppid: u32) -> Result<Vec<OsString>, Box<dyn std::error
         .copied()
         .collect();
 
-    let current_env: Vec<(String, OsString)> = read_current_env_ordered()?;
+    let current_env: Vec<(String, OsString)> = match dotenv {
+        Some(map) => map
+            .iter()
+            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.clone()))
+            .collect(),
+        None => read_current_env_ordered()?,
+    };
+
     let current_keys: HashSet<String> = current_env.iter().map(|(k, _)| k.clone()).collect();
     let exclusive_keys: HashSet<&str> = current_keys
         .iter()
