@@ -39,6 +39,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|m| m.file_type().is_symlink())
         .unwrap_or(false);
 
+    // Determine the target binary and user arguments based on invocation mode:
+    //
+    // Symlink mode: argv0 is a symlink (e.g., `python -> sandbox-run`).
+    //   The actual binary is found by searching PATH for an executable with the
+    //   same basename, skipping any candidate that resolves to sandbox-run itself
+    //   to avoid infinite recursion (e.g., a symlink `sandbox-run -> sandbox-run`).
+    //   All arguments after argv0 are forwarded to the resolved binary.
+    //
+    // Direct mode: invoked directly as `sandbox-run <cmd> [args...]`.
+    //   The first argument is the command to run, resolved via PATH. The same
+    //   self-avoidance applies: `sandbox-run sandbox-run ...` resolves to the
+    //   real binary rather than recursing into itself.
     let (bin, user_args): (PathBuf, Vec<OsString>) = if is_symlink {
         let base = argv0_path.file_name().unwrap_or(argv0.as_ref());
         let resolved = resolve_symlink_bin(argv0, base)?;
