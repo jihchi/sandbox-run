@@ -8,8 +8,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn main() {
+    let prog = env::args_os()
+        .next()
+        .and_then(|a| {
+            Path::new(&a)
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "sandbox-run".to_string());
+
     if let Err(e) = run() {
-        eprintln!("sandbox-run: {e}");
+        eprintln!("{prog}: {e}");
         std::process::exit(1);
     }
 }
